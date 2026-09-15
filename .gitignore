@@ -1,0 +1,38 @@
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local databases
+*.db
+*.db.*
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+predita-error.log
+
+# Evidence / uploaded investigation files
+evidence_uploads/
+uploads/
+
+# Local backups
+*.backup*
+*backup*
+
+# Build/archive files
+*.zip
+*.tar
+*.tar.gz
+
+# OS/editor files
+.DS_Store
+*.swp
