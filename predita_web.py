@@ -1224,6 +1224,15 @@ def create_user():
 def import_data(case_id,dataset):
     abort(404)
 
+
+@app.route("/api/mtn/callback", methods=["GET", "POST"])
+def mtn_callback():
+    return {"status": "received"}, 200
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "predita"}, 200
+
 if __name__ == "__main__":
     host=os.environ.get("PREDITA_HOST","127.0.0.1")
     port=int(os.environ.get("PORT","5000"))
