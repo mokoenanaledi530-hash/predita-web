@@ -61,6 +61,34 @@ MTN_KYC_BASE_URL = os.environ.get(
     "https://api.mtn.com/v1/kycVerification"
 )
 
+# MTN TMF666 Financial Account Management.
+# Predita consumes an MTN-provisioned bearer token.
+MTN_TMF666_ENABLED = (
+    os.environ.get("PREDITA_ENABLE_MTN_TMF666", "0") == "1"
+)
+MTN_TMF666_BEARER_TOKEN = os.environ.get(
+    "MTN_TMF666_BEARER_TOKEN",
+    ""
+)
+MTN_TMF666_BASE_URL = os.environ.get(
+    "MTN_TMF666_BASE_URL",
+    "https://api.mtn.com/tmf-api/financialProfile/v1"
+)
+
+# MTN TMF666 Financial Account Management.
+# Predita consumes an MTN-provisioned bearer token.
+MTN_TMF666_ENABLED = (
+    os.environ.get("PREDITA_ENABLE_MTN_TMF666", "0") == "1"
+)
+MTN_TMF666_BEARER_TOKEN = os.environ.get(
+    "MTN_TMF666_BEARER_TOKEN",
+    ""
+)
+MTN_TMF666_BASE_URL = os.environ.get(
+    "MTN_TMF666_BASE_URL",
+    "https://api.mtn.com/tmf-api/financialProfile/v1"
+)
+
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
@@ -915,6 +943,496 @@ def mtn_sim_swap_indicator(msisdn):
     return result
 
 
+def mask_financial_account(value):
+    value = str(value or "").strip()
+
+    if len(value) <= 4:
+        return "****"
+
+    return value[:2] + ("*" * min(len(value) - 4, 10)) + value[-2:]
+
+
+def mtn_tmf666_get(
+    account_id,
+    capability,
+    transaction_id=None,
+    debit_credit=None,
+    limit=20,
+):
+    """
+    Read-only MTN TMF666 financial account connector.
+
+    Raw bearer credentials are never stored or returned.
+    Only fields explicitly documented and required by Predita
+    are retained in the returned object.
+    """
+    if not MTN_TMF666_ENABLED:
+        return {
+            "ok": False,
+            "status": "disabled",
+            "message": "MTN TMF666 financial-account checks are disabled.",
+        }
+
+    if not MTN_TMF666_BEARER_TOKEN:
+        return {
+            "ok": False,
+            "status": "missing_credentials",
+            "message": (
+                "MTN TMF666 bearer token is not configured on Render."
+            ),
+        }
+
+    account_id = str(account_id or "").strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", account_id):
+        return {
+            "ok": False,
+            "status": "invalid_account_id",
+            "message": "Invalid financial account identifier.",
+        }
+
+    account_path = quote(account_id, safe="")
+
+    params = {}
+
+    if capability == "balance":
+        path = f"/financialAccount/{account_path}/balance"
+        params = {
+            "balanceLevel": 2,
+            "outStandingBasedOn": "E",
+        }
+
+    elif capability == "outstanding":
+        path = f"/financialAccount/{account_path}/outstandingBalance"
+        params = {
+            "outStandingBasedOn": "E",
+        }
+
+    elif capability == "transactions":
+        path = f"/financialAccount/{account_path}/transaction"
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 20
+
+        limit = max(1, min(limit, 50))
+        params["limit"] = limit
+
+        if debit_credit:
+            debit_credit = str(debit_credit).upper()
+
+            if debit_credit not in {"D", "C"}:
+                return {
+                    "ok": False,
+                    "status": "invalid_filter",
+                    "message": "Debit/credit filter must be D or C.",
+                }
+
+            params["debitCredit"] = debit_credit
+
+    elif capability == "transaction_detail":
+        transaction_id = str(transaction_id or "").strip()
+
+        if not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}",
+            transaction_id,
+        ):
+            return {
+                "ok": False,
+                "status": "invalid_transaction_id",
+                "message": "A valid transaction identifier is required.",
+            }
+
+        tid = quote(transaction_id, safe="")
+        path = (
+            f"/financialAccount/{account_path}"
+            f"/transaction/{tid}"
+        )
+
+    else:
+        return {
+            "ok": False,
+            "status": "unsupported_capability",
+            "message": "Unsupported TMF666 capability.",
+        }
+
+    url = MTN_TMF666_BASE_URL.rstrip("/") + path
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": (
+            f"Bearer {MTN_TMF666_BEARER_TOKEN}"
+        ),
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "status": "network_error",
+            "message": str(exc),
+            "http_status": None,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if not response.ok:
+        safe_error = {}
+
+        if isinstance(payload, dict):
+            for field in (
+                "code",
+                "reason",
+                "message",
+                "status",
+            ):
+                if field in payload:
+                    safe_error[field] = payload[field]
+
+        return {
+            "ok": False,
+            "status": "provider_error",
+            "http_status": response.status_code,
+            "data": safe_error,
+            "message": safe_error.get(
+                "reason",
+                safe_error.get(
+                    "message",
+                    "MTN financial-account request failed."
+                ),
+            ),
+        }
+
+    amount_fields = {
+        "totalDebitAmount",
+        "totalCreditAmount",
+        "totalUnbilledAmount",
+        "billedOutstandingAmount",
+        "totalOustandingAmount",
+    }
+
+    transaction_fields = {
+        "transactionNumber",
+        "transactionDate",
+        "debitCredit",
+        "amount",
+        "remarks",
+        "channel",
+        "currency",
+        "status",
+        "runningTotal",
+        "paymentId",
+        "externalReference",
+        "isCleared",
+        "financialPostingStatus",
+    }
+
+    safe_data = {}
+
+    if capability in {"balance", "outstanding"}:
+        if isinstance(payload, dict):
+            safe_data = {
+                key: payload.get(key)
+                for key in amount_fields
+                if key in payload
+            }
+
+    elif capability == "transactions":
+        transactions = []
+
+        if isinstance(payload, dict):
+            source = payload.get("transactions") or []
+        elif isinstance(payload, list):
+            source = payload
+        else:
+            source = []
+
+        for item in source[:50]:
+            if not isinstance(item, dict):
+                continue
+
+            transactions.append({
+                key: item.get(key)
+                for key in transaction_fields
+                if key in item
+            })
+
+        safe_data = {
+            "transactions": transactions,
+            "count": len(transactions),
+        }
+
+    elif capability == "transaction_detail":
+        if isinstance(payload, dict):
+            safe_data = {
+                key: payload.get(key)
+                for key in transaction_fields
+                if key in payload
+            }
+
+    return {
+        "ok": True,
+        "status": "success",
+        "http_status": response.status_code,
+        "data": safe_data,
+    }
+
+
+def mask_financial_account(value):
+    value = str(value or "").strip()
+
+    if len(value) <= 4:
+        return "****"
+
+    return value[:2] + ("*" * min(len(value) - 4, 10)) + value[-2:]
+
+
+def mtn_tmf666_get(
+    account_id,
+    capability,
+    transaction_id=None,
+    debit_credit=None,
+    limit=20,
+):
+    """
+    Read-only MTN TMF666 financial account connector.
+
+    Raw bearer credentials are never stored or returned.
+    Only fields explicitly documented and required by Predita
+    are retained in the returned object.
+    """
+    if not MTN_TMF666_ENABLED:
+        return {
+            "ok": False,
+            "status": "disabled",
+            "message": "MTN TMF666 financial-account checks are disabled.",
+        }
+
+    if not MTN_TMF666_BEARER_TOKEN:
+        return {
+            "ok": False,
+            "status": "missing_credentials",
+            "message": (
+                "MTN TMF666 bearer token is not configured on Render."
+            ),
+        }
+
+    account_id = str(account_id or "").strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", account_id):
+        return {
+            "ok": False,
+            "status": "invalid_account_id",
+            "message": "Invalid financial account identifier.",
+        }
+
+    account_path = quote(account_id, safe="")
+
+    params = {}
+
+    if capability == "balance":
+        path = f"/financialAccount/{account_path}/balance"
+        params = {
+            "balanceLevel": 2,
+            "outStandingBasedOn": "E",
+        }
+
+    elif capability == "outstanding":
+        path = f"/financialAccount/{account_path}/outstandingBalance"
+        params = {
+            "outStandingBasedOn": "E",
+        }
+
+    elif capability == "transactions":
+        path = f"/financialAccount/{account_path}/transaction"
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 20
+
+        limit = max(1, min(limit, 50))
+        params["limit"] = limit
+
+        if debit_credit:
+            debit_credit = str(debit_credit).upper()
+
+            if debit_credit not in {"D", "C"}:
+                return {
+                    "ok": False,
+                    "status": "invalid_filter",
+                    "message": "Debit/credit filter must be D or C.",
+                }
+
+            params["debitCredit"] = debit_credit
+
+    elif capability == "transaction_detail":
+        transaction_id = str(transaction_id or "").strip()
+
+        if not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}",
+            transaction_id,
+        ):
+            return {
+                "ok": False,
+                "status": "invalid_transaction_id",
+                "message": "A valid transaction identifier is required.",
+            }
+
+        tid = quote(transaction_id, safe="")
+        path = (
+            f"/financialAccount/{account_path}"
+            f"/transaction/{tid}"
+        )
+
+    else:
+        return {
+            "ok": False,
+            "status": "unsupported_capability",
+            "message": "Unsupported TMF666 capability.",
+        }
+
+    url = MTN_TMF666_BASE_URL.rstrip("/") + path
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": (
+            f"Bearer {MTN_TMF666_BEARER_TOKEN}"
+        ),
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "status": "network_error",
+            "message": str(exc),
+            "http_status": None,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if not response.ok:
+        safe_error = {}
+
+        if isinstance(payload, dict):
+            for field in (
+                "code",
+                "reason",
+                "message",
+                "status",
+            ):
+                if field in payload:
+                    safe_error[field] = payload[field]
+
+        return {
+            "ok": False,
+            "status": "provider_error",
+            "http_status": response.status_code,
+            "data": safe_error,
+            "message": safe_error.get(
+                "reason",
+                safe_error.get(
+                    "message",
+                    "MTN financial-account request failed."
+                ),
+            ),
+        }
+
+    amount_fields = {
+        "totalDebitAmount",
+        "totalCreditAmount",
+        "totalUnbilledAmount",
+        "billedOutstandingAmount",
+        "totalOustandingAmount",
+    }
+
+    transaction_fields = {
+        "transactionNumber",
+        "transactionDate",
+        "debitCredit",
+        "amount",
+        "remarks",
+        "channel",
+        "currency",
+        "status",
+        "runningTotal",
+        "paymentId",
+        "externalReference",
+        "isCleared",
+        "financialPostingStatus",
+    }
+
+    safe_data = {}
+
+    if capability in {"balance", "outstanding"}:
+        if isinstance(payload, dict):
+            safe_data = {
+                key: payload.get(key)
+                for key in amount_fields
+                if key in payload
+            }
+
+    elif capability == "transactions":
+        transactions = []
+
+        if isinstance(payload, dict):
+            source = payload.get("transactions") or []
+        elif isinstance(payload, list):
+            source = payload
+        else:
+            source = []
+
+        for item in source[:50]:
+            if not isinstance(item, dict):
+                continue
+
+            transactions.append({
+                key: item.get(key)
+                for key in transaction_fields
+                if key in item
+            })
+
+        safe_data = {
+            "transactions": transactions,
+            "count": len(transactions),
+        }
+
+    elif capability == "transaction_detail":
+        if isinstance(payload, dict):
+            safe_data = {
+                key: payload.get(key)
+                for key in transaction_fields
+                if key in payload
+            }
+
+    return {
+        "ok": True,
+        "status": "success",
+        "http_status": response.status_code,
+        "data": safe_data,
+    }
+
+
 def mtn_kyc_verify(customer_id, attributes):
     """
     Consent-gated, single-customer MTN KYC verification.
@@ -1566,6 +2084,194 @@ def case_view(case_id):
     </div>
     {% endif %}
 
+    {% if can('manage_users') %}
+    <div class="card">
+      <h3>
+        MTN Financial Account
+        <span class="badge">Admin only</span>
+      </h3>
+
+      <p class="small">
+        Read-only MTN TMF666 access. This function is restricted
+        to an open Predita case with a recorded authority reference
+        and a stated case-specific purpose. Results are displayed
+        to the administrator and are not added to general search.
+      </p>
+
+      <form method="post"
+            action="{{ url_for('financial_account_check',
+                               case_id=case['case_id']) }}">
+
+        <input type="hidden"
+               name="csrf"
+               value="{{ csrf_token() }}">
+
+        <div class="grid">
+
+          <div>
+            <label>Financial account identifier</label>
+            <input name="account_id"
+                   maxlength="128"
+                   autocomplete="off"
+                   required>
+          </div>
+
+          <div>
+            <label>Operation</label>
+            <select name="capability">
+              <option value="balance">
+                Account balance
+              </option>
+              <option value="outstanding">
+                Outstanding balance
+              </option>
+              <option value="transactions">
+                Transaction list
+              </option>
+              <option value="transaction_detail">
+                Transaction detail
+              </option>
+            </select>
+          </div>
+
+          <div>
+            <label>Transaction ID (detail only)</label>
+            <input name="transaction_id"
+                   maxlength="128"
+                   autocomplete="off">
+          </div>
+
+          <div>
+            <label>Debit / credit filter</label>
+            <select name="debit_credit">
+              <option value="">All</option>
+              <option value="D">Debit</option>
+              <option value="C">Credit</option>
+            </select>
+          </div>
+
+          <div>
+            <label>Transaction limit</label>
+            <input name="limit"
+                   type="number"
+                   min="1"
+                   max="50"
+                   value="20">
+          </div>
+
+          <div>
+            <label>Case-specific purpose</label>
+            <input name="purpose"
+                   maxlength="200"
+                   required>
+          </div>
+
+        </div>
+
+        <div style="margin-top:12px">
+          <button>
+            Run authorized financial-account check
+          </button>
+        </div>
+
+      </form>
+    </div>
+    {% endif %}
+
+    {% if can('manage_users') %}
+    <div class="card">
+      <h3>
+        MTN Financial Account
+        <span class="badge">Admin only</span>
+      </h3>
+
+      <p class="small">
+        Read-only MTN TMF666 access. This function is restricted
+        to an open Predita case with a recorded authority reference
+        and a stated case-specific purpose. Results are displayed
+        to the administrator and are not added to general search.
+      </p>
+
+      <form method="post"
+            action="{{ url_for('financial_account_check',
+                               case_id=case['case_id']) }}">
+
+        <input type="hidden"
+               name="csrf"
+               value="{{ csrf_token() }}">
+
+        <div class="grid">
+
+          <div>
+            <label>Financial account identifier</label>
+            <input name="account_id"
+                   maxlength="128"
+                   autocomplete="off"
+                   required>
+          </div>
+
+          <div>
+            <label>Operation</label>
+            <select name="capability">
+              <option value="balance">
+                Account balance
+              </option>
+              <option value="outstanding">
+                Outstanding balance
+              </option>
+              <option value="transactions">
+                Transaction list
+              </option>
+              <option value="transaction_detail">
+                Transaction detail
+              </option>
+            </select>
+          </div>
+
+          <div>
+            <label>Transaction ID (detail only)</label>
+            <input name="transaction_id"
+                   maxlength="128"
+                   autocomplete="off">
+          </div>
+
+          <div>
+            <label>Debit / credit filter</label>
+            <select name="debit_credit">
+              <option value="">All</option>
+              <option value="D">Debit</option>
+              <option value="C">Credit</option>
+            </select>
+          </div>
+
+          <div>
+            <label>Transaction limit</label>
+            <input name="limit"
+                   type="number"
+                   min="1"
+                   max="50"
+                   value="20">
+          </div>
+
+          <div>
+            <label>Case-specific purpose</label>
+            <input name="purpose"
+                   maxlength="200"
+                   required>
+          </div>
+
+        </div>
+
+        <div style="margin-top:12px">
+          <button>
+            Run authorized financial-account check
+          </button>
+        </div>
+
+      </form>
+    </div>
+    {% endif %}
+
     <div class="card">
       <h3>Approved network checks</h3>
       <p class="small">
@@ -1816,6 +2522,422 @@ def request_consent(case_id):
         )
 
     return redirect(url_for("case_view", case_id=case_id))
+
+
+@app.post("/case/<case_id>/financial-account-check")
+@require_permission("manage_users")
+def financial_account_check(case_id):
+    check_csrf()
+
+    case = require_case(case_id)
+
+    if case["status"] != "open":
+        audit(
+            "financial_account_check_blocked",
+            case_id,
+            "reason=closed_case",
+        )
+        flash(
+            "Financial-account access is allowed only for an open case.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    authority_ref = str(
+        case["authority_ref"] or ""
+    ).strip()
+
+    if not authority_ref:
+        audit(
+            "financial_account_check_blocked",
+            case_id,
+            "reason=missing_authority_ref",
+        )
+        flash(
+            "This case does not contain an authority reference.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    account_id = request.form.get(
+        "account_id",
+        "",
+    ).strip()
+
+    capability = request.form.get(
+        "capability",
+        "",
+    ).strip()
+
+    transaction_id = request.form.get(
+        "transaction_id",
+        "",
+    ).strip()
+
+    debit_credit = request.form.get(
+        "debit_credit",
+        "",
+    ).strip()
+
+    purpose = request.form.get(
+        "purpose",
+        "",
+    ).strip()
+
+    if capability not in {
+        "balance",
+        "outstanding",
+        "transactions",
+        "transaction_detail",
+    }:
+        abort(400, "Unsupported financial-account operation.")
+
+    if not purpose:
+        flash(
+            "A case-specific purpose is required.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    if len(purpose) > 200:
+        flash(
+            "Purpose must be 200 characters or fewer.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    try:
+        requested_limit = int(
+            request.form.get("limit", "20")
+        )
+    except ValueError:
+        requested_limit = 20
+
+    requested_limit = max(
+        1,
+        min(requested_limit, 50),
+    )
+
+    result = mtn_tmf666_get(
+        account_id=account_id,
+        capability=capability,
+        transaction_id=transaction_id,
+        debit_credit=debit_credit or None,
+        limit=requested_limit,
+    )
+
+    masked_account = mask_financial_account(
+        account_id
+    )
+
+    audit(
+        "financial_account_check",
+        case_id,
+        (
+            "provider=MTN; api=TMF666; "
+            f"capability={capability}; "
+            f"account={masked_account}; "
+            f"http={result.get('http_status')}; "
+            f"status={result.get('status')}; "
+            f"purpose={purpose[:160]}"
+        ),
+    )
+
+    result_json = json.dumps(
+        result.get("data") or {},
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    return render_page(
+        "MTN Financial Account Result",
+        """
+        <div class="card">
+
+          <h2>MTN Financial Account Result</h2>
+
+          <p>
+            <span class="badge">
+              {{ capability }}
+            </span>
+          </p>
+
+          <table>
+            <tr>
+              <th>Case</th>
+              <td>{{ case_id }}</td>
+            </tr>
+            <tr>
+              <th>Authority reference</th>
+              <td>{{ authority_ref }}</td>
+            </tr>
+            <tr>
+              <th>Account</th>
+              <td>{{ masked_account }}</td>
+            </tr>
+            <tr>
+              <th>Status</th>
+              <td>{{ status }}</td>
+            </tr>
+            <tr>
+              <th>HTTP</th>
+              <td>{{ http_status if http_status is not none else '' }}</td>
+            </tr>
+          </table>
+
+          {% if message %}
+          <div class="flash {{ 'err' if not ok else '' }}"
+               style="margin-top:14px">
+            {{ message }}
+          </div>
+          {% endif %}
+
+          <h3>Result</h3>
+
+          <pre style="
+              white-space:pre-wrap;
+              overflow:auto;
+              background:#0d1627;
+              border:1px solid #26344c;
+              padding:14px;
+              border-radius:9px;
+          ">{{ result_json }}</pre>
+
+          <p>
+            <a href="{{ url_for('case_view',
+                                case_id=case_id) }}">
+              Return to case
+            </a>
+          </p>
+
+        </div>
+        """,
+        case_id=case_id,
+        authority_ref=authority_ref,
+        masked_account=masked_account,
+        capability=capability,
+        status=result.get("status"),
+        http_status=result.get("http_status"),
+        message=result.get("message"),
+        ok=result.get("ok"),
+        result_json=result_json,
+    )
+
+
+@app.post("/case/<case_id>/financial-account-check")
+@require_permission("manage_users")
+def financial_account_check(case_id):
+    check_csrf()
+
+    case = require_case(case_id)
+
+    if case["status"] != "open":
+        audit(
+            "financial_account_check_blocked",
+            case_id,
+            "reason=closed_case",
+        )
+        flash(
+            "Financial-account access is allowed only for an open case.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    authority_ref = str(
+        case["authority_ref"] or ""
+    ).strip()
+
+    if not authority_ref:
+        audit(
+            "financial_account_check_blocked",
+            case_id,
+            "reason=missing_authority_ref",
+        )
+        flash(
+            "This case does not contain an authority reference.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    account_id = request.form.get(
+        "account_id",
+        "",
+    ).strip()
+
+    capability = request.form.get(
+        "capability",
+        "",
+    ).strip()
+
+    transaction_id = request.form.get(
+        "transaction_id",
+        "",
+    ).strip()
+
+    debit_credit = request.form.get(
+        "debit_credit",
+        "",
+    ).strip()
+
+    purpose = request.form.get(
+        "purpose",
+        "",
+    ).strip()
+
+    if capability not in {
+        "balance",
+        "outstanding",
+        "transactions",
+        "transaction_detail",
+    }:
+        abort(400, "Unsupported financial-account operation.")
+
+    if not purpose:
+        flash(
+            "A case-specific purpose is required.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    if len(purpose) > 200:
+        flash(
+            "Purpose must be 200 characters or fewer.",
+            "error",
+        )
+        return redirect(
+            url_for("case_view", case_id=case_id)
+        )
+
+    try:
+        requested_limit = int(
+            request.form.get("limit", "20")
+        )
+    except ValueError:
+        requested_limit = 20
+
+    requested_limit = max(
+        1,
+        min(requested_limit, 50),
+    )
+
+    result = mtn_tmf666_get(
+        account_id=account_id,
+        capability=capability,
+        transaction_id=transaction_id,
+        debit_credit=debit_credit or None,
+        limit=requested_limit,
+    )
+
+    masked_account = mask_financial_account(
+        account_id
+    )
+
+    audit(
+        "financial_account_check",
+        case_id,
+        (
+            "provider=MTN; api=TMF666; "
+            f"capability={capability}; "
+            f"account={masked_account}; "
+            f"http={result.get('http_status')}; "
+            f"status={result.get('status')}; "
+            f"purpose={purpose[:160]}"
+        ),
+    )
+
+    result_json = json.dumps(
+        result.get("data") or {},
+        indent=2,
+        ensure_ascii=False,
+    )
+
+    return render_page(
+        "MTN Financial Account Result",
+        """
+        <div class="card">
+
+          <h2>MTN Financial Account Result</h2>
+
+          <p>
+            <span class="badge">
+              {{ capability }}
+            </span>
+          </p>
+
+          <table>
+            <tr>
+              <th>Case</th>
+              <td>{{ case_id }}</td>
+            </tr>
+            <tr>
+              <th>Authority reference</th>
+              <td>{{ authority_ref }}</td>
+            </tr>
+            <tr>
+              <th>Account</th>
+              <td>{{ masked_account }}</td>
+            </tr>
+            <tr>
+              <th>Status</th>
+              <td>{{ status }}</td>
+            </tr>
+            <tr>
+              <th>HTTP</th>
+              <td>{{ http_status if http_status is not none else '' }}</td>
+            </tr>
+          </table>
+
+          {% if message %}
+          <div class="flash {{ 'err' if not ok else '' }}"
+               style="margin-top:14px">
+            {{ message }}
+          </div>
+          {% endif %}
+
+          <h3>Result</h3>
+
+          <pre style="
+              white-space:pre-wrap;
+              overflow:auto;
+              background:#0d1627;
+              border:1px solid #26344c;
+              padding:14px;
+              border-radius:9px;
+          ">{{ result_json }}</pre>
+
+          <p>
+            <a href="{{ url_for('case_view',
+                                case_id=case_id) }}">
+              Return to case
+            </a>
+          </p>
+
+        </div>
+        """,
+        case_id=case_id,
+        authority_ref=authority_ref,
+        masked_account=masked_account,
+        capability=capability,
+        status=result.get("status"),
+        http_status=result.get("http_status"),
+        message=result.get("message"),
+        ok=result.get("ok"),
+        result_json=result_json,
+    )
 
 
 @app.post("/case/<case_id>/kyc-check")
