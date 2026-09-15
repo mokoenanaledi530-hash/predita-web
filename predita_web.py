@@ -32,6 +32,22 @@ MTN_CHECKS_ENABLED = os.environ.get("PREDITA_ENABLE_MTN_CHECKS", "0") == "1"
 MTN_API_KEY = os.environ.get("MTN_API_KEY", "")
 MTN_BEARER_TOKEN = os.environ.get("MTN_BEARER_TOKEN", "")
 MTN_BASE_URL = os.environ.get("MTN_BASE_URL", "https://api.mtn.com")
+MTN_CALLBACK_URL = os.environ.get(
+    "MTN_CALLBACK_URL",
+    "https://predita-web.onrender.com/api/mtn/callback"
+)
+MTN_CONSENT_FLOW = os.environ.get("MTN_CONSENT_FLOW", "sms").strip().lower()
+MTN_CONSENT_TTL_MINUTES = int(
+    os.environ.get("MTN_CONSENT_TTL_MINUTES", "60")
+)
+MTN_CONSENT_MESSAGE = os.environ.get(
+    "MTN_CONSENT_MESSAGE",
+    "Predita requests your consent to perform an MTN subscriber verification check. "
+    "Please accept or reject the consent request presented by MTN."
+)
+MTN_CALLBACK_SIGNING_KEY = (
+    os.environ.get("PREDITA_CALLBACK_SIGNING_KEY") or SECRET_KEY
+)
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -232,6 +248,34 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_provider_checks_case
       ON provider_checks(case_id, checked_at);
+
+    CREATE TABLE IF NOT EXISTS consent_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL UNIQUE,
+      case_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'MTN',
+      msisdn_norm TEXT NOT NULL,
+      flow_type TEXT NOT NULL,
+      confirmation_message TEXT NOT NULL,
+      callback_url TEXT NOT NULL,
+      requested_at TEXT NOT NULL,
+      requested_by TEXT NOT NULL,
+      request_http_status INTEGER,
+      request_status TEXT NOT NULL,
+      provider_response_json TEXT,
+      callback_received_at TEXT,
+      consent_status TEXT NOT NULL DEFAULT 'pending',
+      consent_payload_json TEXT,
+      approved_at TEXT,
+      expires_at TEXT,
+      FOREIGN KEY(case_id) REFERENCES cases(case_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_consent_case_number
+      ON consent_requests(case_id, msisdn_norm, consent_status);
+
+    CREATE INDEX IF NOT EXISTS idx_consent_request_id
+      ON consent_requests(request_id);
 
     CREATE TABLE IF NOT EXISTS audit_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -444,6 +488,275 @@ def file_sha(path):
         for chunk in iter(lambda:f.read(1024*1024),b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _mtn_auth_headers():
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if MTN_API_KEY:
+        headers["X-API-Key"] = MTN_API_KEY
+    elif MTN_BEARER_TOKEN:
+        headers["Authorization"] = f"Bearer {MTN_BEARER_TOKEN}"
+    else:
+        return None
+    return headers
+
+
+def _consent_mac(request_id, case_id, msisdn):
+    message = f"{request_id}|{case_id}|{msisdn}".encode("utf-8")
+    return hmac.new(
+        MTN_CALLBACK_SIGNING_KEY.encode("utf-8"),
+        message,
+        hashlib.sha256
+    ).hexdigest()
+
+
+def request_mtn_consent(case_id, msisdn, flow_type, requested_by):
+    if not MTN_CHECKS_ENABLED:
+        return {
+            "ok": False,
+            "status": "disabled",
+            "message": "MTN integration is not enabled on the server."
+        }
+
+    number = normalize_phone(msisdn)
+    if not number or not number.startswith("+"):
+        return {
+            "ok": False,
+            "status": "invalid_number",
+            "message": "Enter a valid South African mobile number."
+        }
+
+    flow = str(flow_type or MTN_CONSENT_FLOW).strip().lower()
+    if flow not in {"sms", "ussd"}:
+        return {
+            "ok": False,
+            "status": "invalid_flow",
+            "message": "MTN consent flow must be sms or ussd."
+        }
+
+    headers = _mtn_auth_headers()
+    if not headers:
+        return {
+            "ok": False,
+            "status": "missing_credentials",
+            "message": "MTN server credentials are not configured."
+        }
+
+    request_id = secrets.token_hex(16)
+    mac = _consent_mac(request_id, case_id, number)
+
+    body = {
+        "flowType": flow,
+        "confirmationMessage": MTN_CONSENT_MESSAGE,
+        "callbackUrl": MTN_CALLBACK_URL,
+        "customData": [
+            f"predita:req:{request_id}",
+            f"predita:case:{case_id}",
+            f"predita:mac:{mac}",
+        ],
+    }
+
+    con = db()
+    con.execute("""
+      INSERT INTO consent_requests(
+        request_id,case_id,provider,msisdn_norm,flow_type,
+        confirmation_message,callback_url,requested_at,requested_by,
+        request_status,consent_status
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        request_id, case_id, "MTN", number, flow,
+        MTN_CONSENT_MESSAGE, MTN_CALLBACK_URL,
+        now_iso(), requested_by, "sending", "pending"
+    ))
+    con.commit()
+
+    url = f"{MTN_BASE_URL.rstrip('/')}/v1/consent/{number}"
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=20
+        )
+    except requests.RequestException as exc:
+        con = db()
+        con.execute("""
+          UPDATE consent_requests
+          SET request_status='network_error',
+              provider_response_json=?
+          WHERE request_id=?
+        """, (
+            json.dumps({"error": str(exc)}, ensure_ascii=False),
+            request_id
+        ))
+        con.commit()
+
+        return {
+            "ok": False,
+            "status": "network_error",
+            "message": str(exc),
+            "request_id": request_id
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"raw_text": response.text[:2000]}
+
+    request_status = "provider_error"
+
+    if response.ok:
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if data.get("sent") is True:
+            request_status = "sent"
+        else:
+            request_status = "accepted_by_api"
+
+    con = db()
+    con.execute("""
+      UPDATE consent_requests
+      SET request_http_status=?,
+          request_status=?,
+          provider_response_json=?
+      WHERE request_id=?
+    """, (
+        response.status_code,
+        request_status,
+        json.dumps(payload, ensure_ascii=False),
+        request_id
+    ))
+    con.commit()
+
+    return {
+        "ok": response.ok,
+        "status": request_status,
+        "http_status": response.status_code,
+        "payload": payload,
+        "request_id": request_id,
+    }
+
+
+def _find_custom_data(obj):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized == "customdata":
+                if isinstance(value, list):
+                    return [str(x) for x in value]
+                if value is not None:
+                    return [str(value)]
+
+        for value in obj.values():
+            found = _find_custom_data(value)
+            if found:
+                return found
+
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_custom_data(value)
+            if found:
+                return found
+
+    return []
+
+
+def _consent_decision_from_payload(obj):
+    positive = {
+        "approved", "accept", "accepted", "consented",
+        "granted", "yes", "true"
+    }
+    negative = {
+        "rejected", "reject", "declined", "denied",
+        "no", "false"
+    }
+
+    decision_keys = {
+        "consent", "consentstatus", "decision", "answer",
+        "userresponse", "response", "selection", "choice",
+        "approved", "accepted"
+    }
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            k = re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+            if k in decision_keys:
+                if isinstance(value, bool):
+                    return "approved" if value else "rejected"
+
+                v = str(value).strip().lower()
+
+                if v in positive:
+                    return "approved"
+                if v in negative:
+                    return "rejected"
+
+                if k in {"selection", "choice", "answer", "userresponse"}:
+                    if v == "1":
+                        return "approved"
+                    if v == "2":
+                        return "rejected"
+
+            # Generic status fields are accepted only when they contain an
+            # explicit consent decision. "success" or statusCode=0000 alone
+            # does NOT grant consent.
+            if k in {"status", "state"}:
+                v = str(value).strip().lower()
+                if v in positive:
+                    return "approved"
+                if v in negative:
+                    return "rejected"
+
+        for value in obj.values():
+            found = _consent_decision_from_payload(value)
+            if found != "callback_received":
+                return found
+
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _consent_decision_from_payload(value)
+            if found != "callback_received":
+                return found
+
+    return "callback_received"
+
+
+def valid_mtn_consent(case_id, msisdn):
+    number = normalize_phone(msisdn)
+    if not number:
+        return None
+
+    con = db()
+    row = con.execute("""
+      SELECT *
+      FROM consent_requests
+      WHERE case_id=?
+        AND msisdn_norm=?
+        AND provider='MTN'
+        AND consent_status='approved'
+      ORDER BY id DESC
+      LIMIT 1
+    """, (case_id, number)).fetchone()
+
+    if not row:
+        return None
+
+    if not row["expires_at"]:
+        return None
+
+    try:
+        expiry = datetime.fromisoformat(row["expires_at"])
+        if expiry <= datetime.now(timezone.utc):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    return row
+
 
 def mtn_sim_swap_date(msisdn):
     """
@@ -792,6 +1105,16 @@ def case_view(case_id):
       WHERE case_id=? ORDER BY id DESC LIMIT 30
     """,(case_id,)).fetchall()
 
+    consents=con.execute("""
+      SELECT request_id,msisdn_norm,flow_type,requested_at,requested_by,
+             request_http_status,request_status,callback_received_at,
+             consent_status,approved_at,expires_at
+      FROM consent_requests
+      WHERE case_id=?
+      ORDER BY id DESC
+      LIMIT 30
+    """,(case_id,)).fetchall()
+
     audits=con.execute("""
       SELECT event_time,username,action,detail FROM audit_events
       WHERE case_id=? ORDER BY id DESC LIMIT 30
@@ -901,8 +1224,75 @@ def case_view(case_id):
 
     {% if can('provider_check') %}
     <div class="card">
+      <h3>MTN subscriber consent</h3>
+      <p class="small">
+        Request explicit subscriber consent before running a live MTN
+        subscriber verification. Predita will not unlock the provider
+        lookup until an approved consent callback has been correlated
+        to this case and mobile number.
+      </p>
+
+      <form method="post"
+            action="{{ url_for('request_consent',case_id=case['case_id']) }}">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+
+        <div class="grid">
+          <div>
+            <label>Mobile number</label>
+            <input name="number"
+                   placeholder="+27821234567"
+                   required>
+          </div>
+
+          <div>
+            <label>Consent channel</label>
+            <select name="flow_type">
+              <option value="sms">SMS</option>
+              <option value="ussd">USSD</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <button>Request MTN consent</button>
+        </div>
+      </form>
+
+      <div style="overflow:auto;margin-top:14px">
+      <table>
+        <tr>
+          <th>Requested</th>
+          <th>Number</th>
+          <th>Channel</th>
+          <th>MTN request</th>
+          <th>Consent</th>
+          <th>Expires</th>
+        </tr>
+
+        {% for c in consents %}
+        <tr>
+          <td>{{ c['requested_at'] }}</td>
+          <td>{{ c['msisdn_norm'] }}</td>
+          <td>{{ c['flow_type'] }}</td>
+          <td>{{ c['request_status'] }}</td>
+          <td><span class="badge">{{ c['consent_status'] }}</span></td>
+          <td>{{ c['expires_at'] or '' }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="6">No MTN consent requests for this case.</td>
+        </tr>
+        {% endfor %}
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
       <h3>Approved network checks</h3>
-      <p class="small">MTN SIM-swap date uses the server-side MTN Mobile Customer Information API only when you have approved credentials and explicitly enable it.</p>
+      <p class="small">
+        MTN SIM-swap verification is blocked unless this case has
+        current approved consent for the same mobile number.
+      </p>
       <form method="post" action="{{ url_for('network_check',case_id=case['case_id']) }}">
         <input type="hidden" name="csrf" value="{{ csrf_token() }}">
         <div class="grid">
@@ -944,7 +1334,7 @@ def case_view(case_id):
       {% else %}<tr><td colspan="4">No events yet.</td></tr>{% endfor %}
       </table>
     </div>
-    """,case=case,imports=imports,receipts=receipts,rows=rows,q=q,dataset=dataset,checks=checks,audits=audits)
+    """,case=case,imports=imports,receipts=receipts,rows=rows,q=q,dataset=dataset,checks=checks,consents=consents,audits=audits)
 
 @app.post("/case/<case_id>/evidence/receive")
 @require_permission("receive_evidence")
@@ -1107,6 +1497,45 @@ def reject_evidence(case_id, receipt_id):
     return redirect(url_for("case_view", case_id=case_id))
 
 
+
+@app.post("/case/<case_id>/consent/request")
+@require_permission("provider_check")
+def request_consent(case_id):
+    check_csrf()
+    require_case(case_id)
+
+    number = request.form.get("number", "").strip()
+    flow_type = request.form.get("flow_type", MTN_CONSENT_FLOW).strip().lower()
+
+    result = request_mtn_consent(
+        case_id,
+        number,
+        flow_type,
+        session["user"]
+    )
+
+    audit(
+        "consent_request",
+        case_id,
+        f"provider=MTN; request={result.get('request_id','')}; "
+        f"status={result.get('status','unknown')}"
+    )
+
+    if result.get("ok"):
+        flash(
+            "MTN consent request was sent. "
+            "The live subscriber lookup remains locked until consent is confirmed."
+        )
+    else:
+        flash(
+            result.get("message")
+            or f"MTN consent request failed: {result.get('status')}",
+            "error"
+        )
+
+    return redirect(url_for("case_view", case_id=case_id))
+
+
 @app.post("/case/<case_id>/network-check")
 @require_permission("provider_check")
 def network_check(case_id):
@@ -1118,6 +1547,25 @@ def network_check(case_id):
 
     if capability != "mtn_sim_swap":
         abort(400, "Unsupported provider capability.")
+
+    if not number_norm:
+        flash("Enter a valid mobile number.", "error")
+        return redirect(url_for("case_view", case_id=case_id))
+
+    consent = valid_mtn_consent(case_id, number_norm)
+
+    if not consent:
+        audit(
+            "provider_check_blocked_no_consent",
+            case_id,
+            "provider=MTN; capability=sim_swap_date"
+        )
+        flash(
+            "Live MTN lookup blocked: this case does not have current "
+            "approved subscriber consent for that mobile number.",
+            "error"
+        )
+        return redirect(url_for("case_view", case_id=case_id))
 
     result = mtn_sim_swap_date(number)
     con = db()
@@ -1227,6 +1675,107 @@ def import_data(case_id,dataset):
 
 @app.route("/api/mtn/callback", methods=["GET", "POST"])
 def mtn_callback():
+    # GET remains harmless so MTN/onboarding tools can verify the endpoint.
+    if request.method == "GET":
+        return {"status": "ready"}, 200
+
+    payload = request.get_json(silent=True)
+
+    if payload is None and request.form:
+        payload = request.form.to_dict(flat=False)
+
+    if not isinstance(payload, dict):
+        return {"status": "invalid_payload"}, 400
+
+    custom_data = _find_custom_data(payload)
+
+    request_id = None
+    callback_case_id = None
+    supplied_mac = None
+
+    for item in custom_data:
+        if item.startswith("predita:req:"):
+            request_id = item.split("predita:req:", 1)[1]
+        elif item.startswith("predita:case:"):
+            callback_case_id = item.split("predita:case:", 1)[1]
+        elif item.startswith("predita:mac:"):
+            supplied_mac = item.split("predita:mac:", 1)[1]
+
+    if not request_id or not supplied_mac:
+        return {"status": "uncorrelated_callback"}, 400
+
+    con = db()
+
+    row = con.execute("""
+      SELECT *
+      FROM consent_requests
+      WHERE request_id=?
+    """, (request_id,)).fetchone()
+
+    if not row:
+        return {"status": "unknown_request"}, 404
+
+    if callback_case_id and callback_case_id != row["case_id"]:
+        return {"status": "case_mismatch"}, 403
+
+    expected_mac = _consent_mac(
+        row["request_id"],
+        row["case_id"],
+        row["msisdn_norm"]
+    )
+
+    if not hmac.compare_digest(expected_mac, supplied_mac):
+        return {"status": "invalid_callback_correlation"}, 403
+
+    # Do not allow replayed callbacks to change a final consent decision.
+    if row["consent_status"] in {"approved", "rejected"}:
+        return {"status": "received"}, 200
+
+    decision = _consent_decision_from_payload(payload)
+    received_at = now_iso()
+
+    approved_at = None
+    expires_at = None
+
+    if decision == "approved":
+        approved_dt = datetime.now(timezone.utc)
+        approved_at = approved_dt.isoformat()
+        expires_at = (
+            approved_dt + timedelta(minutes=MTN_CONSENT_TTL_MINUTES)
+        ).isoformat()
+
+    con.execute("""
+      UPDATE consent_requests
+      SET callback_received_at=?,
+          consent_status=?,
+          consent_payload_json=?,
+          approved_at=?,
+          expires_at=?
+      WHERE request_id=?
+    """, (
+        received_at,
+        decision,
+        json.dumps(payload, ensure_ascii=False),
+        approved_at,
+        expires_at,
+        request_id
+    ))
+
+    con.execute("""
+      INSERT INTO audit_events(
+        event_time,username,action,case_id,detail,remote_addr
+      ) VALUES(?,?,?,?,?,?)
+    """, (
+        received_at,
+        "mtn_callback",
+        "consent_callback",
+        row["case_id"],
+        f"request={request_id}; decision={decision}",
+        request.remote_addr
+    ))
+
+    con.commit()
+
     return {"status": "received"}, 200
 
 @app.get("/health")
