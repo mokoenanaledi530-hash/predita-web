@@ -827,6 +827,81 @@ def mtn_sim_swap_date(msisdn):
             result["status"] = "unknown_date"
     return result
 
+
+def mtn_sim_swap_indicator(msisdn):
+    """Official MTN Mobile Customer Information SIM-swap indicator."""
+    if not MTN_CHECKS_ENABLED:
+        return {
+            "ok": False,
+            "status": "disabled",
+            "message": "MTN checks are disabled."
+        }
+
+    number = normalize_phone(msisdn)
+    if not number or not number.startswith("+"):
+        return {
+            "ok": False,
+            "status": "invalid_number",
+            "message": "Enter a valid E.164-compatible mobile number."
+        }
+
+    url = (
+        f"{MTN_BASE_URL.rstrip('/')}/v1/mobile/subscribers/"
+        f"{number}/simswap-date-indicator"
+    )
+
+    headers = {
+        "Accept": "application/json",
+        "transactionId": secrets.token_hex(16),
+    }
+
+    if MTN_API_KEY:
+        headers["X-API-Key"] = MTN_API_KEY
+    elif MTN_BEARER_TOKEN:
+        headers["Authorization"] = f"Bearer {MTN_BEARER_TOKEN}"
+    else:
+        return {
+            "ok": False,
+            "status": "missing_credentials",
+            "message": "MTN credentials are not configured on the server."
+        }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "status": "network_error",
+            "message": str(exc),
+            "http_status": None
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"raw_text": response.text[:2000]}
+
+    result = {
+        "ok": response.ok,
+        "status": "success" if response.ok else "provider_error",
+        "http_status": response.status_code,
+        "payload": payload,
+        "provider_transaction_id": (
+            payload.get("transactionId")
+            if isinstance(payload, dict)
+            else None
+        ),
+    }
+
+    if response.ok and isinstance(payload, dict):
+        data = payload.get("data") or {}
+        result["last_sim_swap_indicator"] = data.get(
+            "lastSimswapDateIndicator"
+        )
+
+    return result
+
+
 def require_case(case_id):
     con = db()
     row = con.execute("SELECT * FROM cases WHERE case_id=?", (case_id,)).fetchone()
@@ -1297,7 +1372,10 @@ def case_view(case_id):
         <input type="hidden" name="csrf" value="{{ csrf_token() }}">
         <div class="grid">
           <div><label>Provider capability</label>
-            <select name="capability"><option value="mtn_sim_swap">MTN · Last SIM-swap date</option></select>
+            <select name="capability">
+              <option value="mtn_sim_swap">MTN · Last SIM-swap date</option>
+              <option value="mtn_sim_swap_indicator">MTN · SIM-swap date indicator</option>
+            </select>
           </div>
           <div><label>Mobile number</label><input name="number" placeholder="+27821234567" required></div>
         </div>
@@ -1545,7 +1623,7 @@ def network_check(case_id):
     number = request.form.get("number", "").strip()
     number_norm = normalize_phone(number)
 
-    if capability != "mtn_sim_swap":
+    if capability not in {"mtn_sim_swap", "mtn_sim_swap_indicator"}:
         abort(400, "Unsupported provider capability.")
 
     if not number_norm:
@@ -1567,7 +1645,13 @@ def network_check(case_id):
         )
         return redirect(url_for("case_view", case_id=case_id))
 
-    result = mtn_sim_swap_date(number)
+    if capability == "mtn_sim_swap":
+        result = mtn_sim_swap_date(number)
+        stored_capability = "sim_swap_date"
+    else:
+        result = mtn_sim_swap_indicator(number)
+        stored_capability = "sim_swap_date_indicator"
+
     con = db()
     payload = result.get("payload")
     con.execute("""
@@ -1576,19 +1660,38 @@ def network_check(case_id):
         http_status,provider_transaction_id,result_status,result_json
       ) VALUES(?,?,?,?,?,?,?,?,?,?)
     """, (
-        case_id, "MTN", "sim_swap_date", number_norm or number, now_iso(), session["user"],
+        case_id, "MTN", stored_capability, number_norm or number, now_iso(), session["user"],
         result.get("http_status"), result.get("provider_transaction_id"),
         result.get("status","unknown"),
         json.dumps(payload, ensure_ascii=False) if payload is not None else None
     ))
     con.commit()
 
-    audit("provider_check", case_id, f"MTN sim_swap_date; status={result.get('status')}")
+    audit(
+        "provider_check",
+        case_id,
+        f"MTN {stored_capability}; status={result.get('status')}"
+    )
+
     if result.get("ok"):
-        swap_date = result.get("last_sim_swap_date")
-        flash(f"MTN check completed. Last SIM-swap date: {swap_date or 'unknown/not determined'}.")
+        if capability == "mtn_sim_swap":
+            value = result.get("last_sim_swap_date")
+            flash(
+                "MTN check completed. Last SIM-swap date: "
+                f"{value or 'unknown/not determined'}."
+            )
+        else:
+            value = result.get("last_sim_swap_indicator")
+            flash(
+                "MTN check completed. SIM-swap date indicator: "
+                f"{value if value is not None else 'unknown/not determined'}."
+            )
     else:
-        flash(result.get("message") or f"MTN check status: {result.get('status')}", "error")
+        flash(
+            result.get("message")
+            or f"MTN check status: {result.get('status')}",
+            "error"
+        )
     return redirect(url_for("case_view", case_id=case_id))
 
 @app.route("/admin/users", methods=["GET"])
