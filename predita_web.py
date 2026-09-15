@@ -10,6 +10,7 @@ import sqlite3
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import (
     Flask, abort, flash, redirect, render_template_string,
@@ -47,6 +48,17 @@ MTN_CONSENT_MESSAGE = os.environ.get(
 )
 MTN_CALLBACK_SIGNING_KEY = (
     os.environ.get("PREDITA_CALLBACK_SIGNING_KEY") or SECRET_KEY
+)
+
+# MTN Customer KYC Verification.
+# Credentials remain server-side in Render environment variables.
+MTN_KYC_ENABLED = os.environ.get("PREDITA_ENABLE_MTN_KYC", "0") == "1"
+MTN_KYC_API_KEY = os.environ.get("MTN_KYC_API_KEY", "")
+MTN_KYC_BASIC_USER = os.environ.get("MTN_KYC_BASIC_USER", "")
+MTN_KYC_BASIC_PASSWORD = os.environ.get("MTN_KYC_BASIC_PASSWORD", "")
+MTN_KYC_BASE_URL = os.environ.get(
+    "MTN_KYC_BASE_URL",
+    "https://api.mtn.com/v1/kycVerification"
 )
 
 app = Flask(__name__)
@@ -304,6 +316,7 @@ def init_db():
 
     ensure_column("cases", "title", "TEXT")
     ensure_column("cases", "created_by", "TEXT NOT NULL DEFAULT 'legacy'")
+    ensure_column("cases", "status", "TEXT NOT NULL DEFAULT 'open'")
     ensure_column("imports", "dataset_type", "TEXT NOT NULL DEFAULT 'legacy'")
     ensure_column("imports", "imported_by", "TEXT NOT NULL DEFAULT 'legacy'")
 
@@ -902,6 +915,126 @@ def mtn_sim_swap_indicator(msisdn):
     return result
 
 
+def mtn_kyc_verify(customer_id, attributes):
+    """
+    Consent-gated, single-customer MTN KYC verification.
+
+    Only operator-supplied attributes are sent and only boolean
+    match outcomes are returned to Predita. Bulk and biometric
+    verification are intentionally not exposed.
+    """
+    if not MTN_KYC_ENABLED:
+        return {
+            "ok": False,
+            "status": "disabled",
+            "message": "MTN KYC verification is not enabled on the server."
+        }
+
+    customer = normalize_phone(customer_id)
+
+    # This Predita deployment is restricted to SA MSISDN verification.
+    if not customer or not customer.startswith("+27"):
+        return {
+            "ok": False,
+            "status": "invalid_customer",
+            "message": "Enter a valid South African mobile number."
+        }
+
+    if not (
+        MTN_KYC_API_KEY
+        and MTN_KYC_BASIC_USER
+        and MTN_KYC_BASIC_PASSWORD
+    ):
+        return {
+            "ok": False,
+            "status": "missing_credentials",
+            "message": "MTN KYC credentials are not configured on Render."
+        }
+
+    allowed = {
+        "firstName",
+        "lastName",
+        "dateOfBirth",
+        "gender",
+    }
+
+    clean_attributes = {
+        key: value
+        for key, value in attributes.items()
+        if key in allowed and value not in (None, "")
+    }
+
+    if not clean_attributes:
+        return {
+            "ok": False,
+            "status": "no_attributes",
+            "message": "Supply at least one KYC attribute to verify."
+        }
+
+    url = (
+        f"{MTN_KYC_BASE_URL.rstrip('/')}/customers/"
+        f"{quote(customer, safe='')}"
+    )
+
+    transaction_id = secrets.token_hex(16)
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-Key": MTN_KYC_API_KEY,
+        "transactionId": transaction_id,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            params={"isConsentVerified": "true"},
+            headers=headers,
+            auth=(MTN_KYC_BASIC_USER, MTN_KYC_BASIC_PASSWORD),
+            json=clean_attributes,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "status": "network_error",
+            "message": str(exc),
+            "http_status": None,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    provider_transaction_id = None
+    status_message = None
+
+    if isinstance(payload, dict):
+        provider_transaction_id = payload.get("transactionId")
+        status_message = payload.get("statusMessage")
+
+    matches = {}
+
+    if response.ok and isinstance(payload, dict):
+        data = payload.get("data") or {}
+
+        if isinstance(data, dict):
+            for field in clean_attributes:
+                value = data.get(field)
+                if isinstance(value, bool):
+                    matches[field] = value
+
+    return {
+        "ok": response.ok,
+        "status": "success" if response.ok else "provider_error",
+        "http_status": response.status_code,
+        "provider_transaction_id": provider_transaction_id,
+        "status_message": status_message,
+        "matches": matches,
+    }
+
+
 def require_case(case_id):
     con = db()
     row = con.execute("SELECT * FROM cases WHERE case_id=?", (case_id,)).fetchone()
@@ -1362,6 +1495,77 @@ def case_view(case_id):
       </div>
     </div>
 
+    {% if can('manage_users') %}
+    <div class="card">
+      <h3>
+        MTN Customer KYC Verification
+        <span class="badge">Admin only</span>
+      </h3>
+
+      <p class="small">
+        Single-customer verification only. An open case and current
+        approved MTN consent for the same mobile number are required.
+        Only supplied KYC fields are compared. Bulk and biometric
+        verification are not exposed by Predita.
+      </p>
+
+      <form method="post"
+            action="{{ url_for('kyc_check',case_id=case['case_id']) }}">
+
+        <input type="hidden"
+               name="csrf"
+               value="{{ csrf_token() }}">
+
+        <div class="grid">
+          <div>
+            <label>Customer mobile number</label>
+            <input name="number"
+                   placeholder="+27821234567"
+                   required>
+          </div>
+
+          <div>
+            <label>Verification purpose</label>
+            <input name="purpose"
+                   placeholder="Case-specific verification purpose"
+                   required>
+          </div>
+
+          <div>
+            <label>First name</label>
+            <input name="first_name"
+                   autocomplete="off">
+          </div>
+
+          <div>
+            <label>Last name</label>
+            <input name="last_name"
+                   autocomplete="off">
+          </div>
+
+          <div>
+            <label>Date of birth</label>
+            <input name="date_of_birth"
+                   type="date">
+          </div>
+
+          <div>
+            <label>Gender</label>
+            <select name="gender">
+              <option value="">Not supplied</option>
+              <option value="M">M</option>
+              <option value="F">F</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <button>Run consent-approved KYC check</button>
+        </div>
+      </form>
+    </div>
+    {% endif %}
+
     <div class="card">
       <h3>Approved network checks</h3>
       <p class="small">
@@ -1610,6 +1814,185 @@ def request_consent(case_id):
             or f"MTN consent request failed: {result.get('status')}",
             "error"
         )
+
+    return redirect(url_for("case_view", case_id=case_id))
+
+
+@app.post("/case/<case_id>/kyc-check")
+@require_permission("manage_users")
+def kyc_check(case_id):
+    check_csrf()
+    case = require_case(case_id)
+
+    if case["status"] != "open":
+        audit(
+            "kyc_check_blocked_closed_case",
+            case_id,
+            "provider=MTN"
+        )
+        flash(
+            "MTN KYC verification is permitted only on an open case.",
+            "error"
+        )
+        return redirect(url_for("case_view", case_id=case_id))
+
+    number = request.form.get("number", "").strip()
+    number_norm = normalize_phone(number)
+
+    if not number_norm or not number_norm.startswith("+27"):
+        flash(
+            "Enter a valid South African mobile number.",
+            "error"
+        )
+        return redirect(url_for("case_view", case_id=case_id))
+
+    # Bind KYC verification to the same consent-controlled MSISDN.
+    consent = valid_mtn_consent(case_id, number_norm)
+
+    if not consent:
+        audit(
+            "kyc_check_blocked_no_consent",
+            case_id,
+            "provider=MTN; capability=kyc_verify"
+        )
+        flash(
+            "MTN KYC verification blocked: this case does not "
+            "have current approved consent for that mobile number.",
+            "error"
+        )
+        return redirect(url_for("case_view", case_id=case_id))
+
+    purpose = request.form.get("purpose", "").strip()
+
+    if not purpose:
+        flash("A verification purpose is required.", "error")
+        return redirect(url_for("case_view", case_id=case_id))
+
+    first_name = request.form.get("first_name", "").strip()
+    last_name = request.form.get("last_name", "").strip()
+    date_of_birth = request.form.get("date_of_birth", "").strip()
+    gender = request.form.get("gender", "").strip().upper()
+
+    if date_of_birth and not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}",
+        date_of_birth
+    ):
+        flash("Date of birth must use YYYY-MM-DD.", "error")
+        return redirect(url_for("case_view", case_id=case_id))
+
+    if gender not in {"", "M", "F"}:
+        flash("Gender must be M or F.", "error")
+        return redirect(url_for("case_view", case_id=case_id))
+
+    attributes = {}
+
+    if first_name:
+        attributes["firstName"] = first_name
+
+    if last_name:
+        attributes["lastName"] = last_name
+
+    if date_of_birth:
+        attributes["dateOfBirth"] = date_of_birth
+
+    if gender:
+        attributes["gender"] = gender
+
+    if not attributes:
+        flash(
+            "Supply at least one KYC attribute to compare.",
+            "error"
+        )
+        return redirect(url_for("case_view", case_id=case_id))
+
+    result = mtn_kyc_verify(number_norm, attributes)
+
+    matches = result.get("matches") or {}
+
+    # Do not store the MTN raw KYC response. Keep only match booleans
+    # for attributes the administrator explicitly supplied.
+    safe_result = {
+        "matches": matches,
+        "consent_request_id": consent["request_id"],
+    }
+
+    masked_number = (
+        number_norm[:3]
+        + "*****"
+        + number_norm[-3:]
+    )
+
+    con = db()
+
+    con.execute("""
+      INSERT INTO provider_checks(
+        case_id,
+        provider,
+        capability,
+        msisdn_norm,
+        checked_at,
+        requested_by,
+        http_status,
+        provider_transaction_id,
+        result_status,
+        result_json
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)
+    """, (
+        case_id,
+        "MTN",
+        "kyc_verify",
+        masked_number,
+        now_iso(),
+        session["user"],
+        result.get("http_status"),
+        result.get("provider_transaction_id"),
+        result.get("status", "unknown"),
+        json.dumps(safe_result, ensure_ascii=False),
+    ))
+
+    con.commit()
+
+    audit(
+        "provider_check",
+        case_id,
+        "provider=MTN; capability=kyc_verify; "
+        f"status={result.get('status')}; "
+        f"consent={consent['request_id']}; "
+        f"purpose={purpose[:160]}"
+    )
+
+    if not result.get("ok"):
+        flash(
+            result.get("message")
+            or result.get("status_message")
+            or f"MTN KYC status: {result.get('status')}",
+            "error"
+        )
+        return redirect(url_for("case_view", case_id=case_id))
+
+    names = {
+        "firstName": "First name",
+        "lastName": "Last name",
+        "dateOfBirth": "Date of birth",
+        "gender": "Gender",
+    }
+
+    outcomes = []
+
+    for field in attributes:
+        if field in matches:
+            result_text = "MATCH" if matches[field] else "NO MATCH"
+        else:
+            result_text = "NOT RETURNED"
+
+        outcomes.append(
+            f"{names.get(field, field)}: {result_text}"
+        )
+
+    flash(
+        "MTN KYC verification completed. "
+        + " · ".join(outcomes)
+    )
 
     return redirect(url_for("case_view", case_id=case_id))
 
