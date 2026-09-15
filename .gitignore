@@ -36,3 +36,4 @@ uploads/
 # OS/editor files
 .DS_Store
 *.swp
+predita_web.py.before-consent
