@@ -2829,6 +2829,12 @@ def mtn_callback():
 def health():
     return {"status": "ok", "service": "predita"}, 200
 
+# Optional MTN Subscriptions v2 extension.
+# Disabled unless PREDITA_ENABLE_MTN_SUBSCRIPTIONS=1 and server-side OAuth credentials exist.
+import sys as _sys
+from mtn_subscriptions import register_mtn_subscriptions as _register_mtn_subscriptions
+_register_mtn_subscriptions(app, _sys.modules[__name__])
+
 if __name__ == "__main__":
     host=os.environ.get("PREDITA_HOST","127.0.0.1")
     port=int(os.environ.get("PORT","5000"))
